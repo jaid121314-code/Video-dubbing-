@@ -1,24 +1,24 @@
 FROM node:20-bookworm-slim
 
-# Install ffmpeg
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
+COPY package.json ./
 RUN npm install --omit=dev=false
 
 COPY tsconfig.json ./
 COPY src ./src
-RUN npm run build && npm prune --omit=dev
+
+RUN npx tsc
 
 ENV NODE_ENV=production
 ENV PORT=8080
-ENV FFMPEG_PATH=/usr/bin/ffmpeg
-ENV FFPROBE_PATH=/usr/bin/ffprobe
-ENV STORAGE_DIR=/data
+ENV WORK_DIR=/data
+RUN mkdir -p /data
 
 EXPOSE 8080
 
