@@ -12,13 +12,22 @@ const PORT = Number(process.env.PORT || 8080);
 const WORK_DIR = process.env.WORK_DIR || path.join(os.tmpdir(), "dubforge");
 const CONCURRENCY = Number(process.env.CONCURRENCY || 8);
 
+// Smart Hybrid & Audio settings
+const AUDIO_SAFE_MIN = Number(process.env.AUDIO_SAFE_MIN || 0.85);
+const AUDIO_SAFE_MAX = Number(process.env.AUDIO_SAFE_MAX || 1.25);
+const LOUDNESS_TARGET = Number(process.env.LOUDNESS_TARGET || -16);
+const FADE_IN_SEC = Number(process.env.FADE_IN_SEC || 0.03);
+const FADE_OUT_SEC = Number(process.env.FADE_OUT_SEC || 0.03);
+const VIDEO_CRF = Number(process.env.VIDEO_CRF || 18);
+const VIDEO_PRESET = process.env.VIDEO_PRESET || "veryfast";
+
 await fs.mkdir(WORK_DIR, { recursive: true });
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 
-// ===== Job tracking =====
+// ===== Types =====
 interface JobStatus {
   total: number;
   completed: number;
@@ -28,17 +37,41 @@ interface JobStatus {
   startedAt: number;
   finishedAt?: number;
 }
+
+interface ClipLog {
+  clip: number;
+  start?: number;
+  end?: number;
+  videoDur?: number;
+  audioDur?: number;
+  requiredTempo?: number;
+  usedAudioTempo?: number;
+  videoReencoded?: boolean;
+  status: "done" | "failed";
+  error?: string;
+}
+
+interface HybridWarning {
+  clip: number;
+  requiredTempo: number;
+  usedAudioTempo: number;
+  videoReencoded: boolean;
+  reason: string;
+}
+
 const jobs = new Map<string, JobStatus>();
 
 // ===== Helpers =====
-function run(cmd: string, args: string[]): Promise<void> {
+function run(cmd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
     let stderr = "";
+    p.stdout.on("data", (d) => (stdout += d.toString()));
     p.stderr.on("data", (d) => (stderr += d.toString()));
     p.on("error", reject);
     p.on("close", (code) => {
-      if (code === 0) resolve();
+      if (code === 0) resolve(stdout);
       else reject(new Error(`${cmd} failed (${code}): ${stderr.slice(-1500)}`));
     });
   });
@@ -67,17 +100,13 @@ function sessionDir(sid: string): string {
   return path.join(WORK_DIR, safe);
 }
 
+function clamp(val: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, val));
+}
+
 /**
- * Build an atempo filter chain that approximates the target tempo while
- * keeping each individual atempo step within a "natural" range so the voice
- * doesn't sound robotic or chipmunky.
- *
- * mode = "natural":  clamps each factor to [0.85, 1.20] and may not reach
- *                    the exact target — caller can pad/trim to fit.
- * mode = "aggressive": chains factors within [0.5, 2.0] (FFmpeg's hard limit)
- *                     to reach the target exactly.
- *
- * Returns { chain: "atempo=...,atempo=...", effectiveTempo: number }
+ * Build an atempo filter chain for natural/aggressive modes.
+ * For smart_hybrid, this is handled separately.
  */
 function buildTempoChain(
   tempo: number,
@@ -85,8 +114,10 @@ function buildTempoChain(
 ): { chain: string; effective: number } {
   if (!isFinite(tempo) || tempo <= 0) return { chain: "atempo=1.0", effective: 1.0 };
 
-  const SAFE_MIN = 0.85, SAFE_MAX = 1.20;
-  const HARD_MIN = 0.5,  HARD_MAX = 2.0;
+  const SAFE_MIN = AUDIO_SAFE_MIN;
+  const SAFE_MAX = AUDIO_SAFE_MAX;
+  const HARD_MIN = 0.5;
+  const HARD_MAX = 2.0;
 
   // Within safe range: one step, sounds great.
   if (tempo >= SAFE_MIN && tempo <= SAFE_MAX) {
@@ -94,7 +125,7 @@ function buildTempoChain(
   }
 
   if (mode === "natural") {
-    // Clamp softly to acceptable range (0.75..1.35) using up to two safe steps.
+    // Clamp softly
     const ACCEPT_MIN = 0.75, ACCEPT_MAX = 1.35;
     const target = Math.min(ACCEPT_MAX, Math.max(ACCEPT_MIN, tempo));
     if (target >= SAFE_MIN && target <= SAFE_MAX) {
@@ -107,7 +138,7 @@ function buildTempoChain(
     return { chain: `atempo=${r.toFixed(4)},atempo=${r.toFixed(4)}`, effective };
   }
 
-  // aggressive: chain within hard limits, prefer steps near safe range
+  // aggressive: chain within hard limits
   const steps: number[] = [];
   let remaining = tempo;
   while (remaining > SAFE_MAX) {
@@ -123,6 +154,35 @@ function buildTempoChain(
   steps.push(remaining);
   const effective = steps.reduce((a, b) => a * b, 1);
   return { chain: steps.map((s) => `atempo=${s.toFixed(4)}`).join(","), effective };
+}
+
+/**
+ * Build audio filter chain for smart_hybrid or natural/aggressive with loudness + fade.
+ */
+function buildAudioFilterChain(
+  tempo: number,
+  mode: "natural" | "aggressive" | "smart_hybrid"
+): string {
+  let chain = "";
+
+  // Step 1: Tempo adjustment
+  if (mode === "smart_hybrid") {
+    // For smart_hybrid, clamp audio to safe range
+    const clampedTempo = clamp(tempo, AUDIO_SAFE_MIN, AUDIO_SAFE_MAX);
+    chain = `atempo=${clampedTempo.toFixed(4)}`;
+  } else {
+    const { chain: tempoChain } = buildTempoChain(tempo, mode);
+    chain = tempoChain;
+  }
+
+  // Step 2: Loudness normalization
+  chain += `,loudnorm=I=${LOUDNESS_TARGET}:TP=-1.5:LRA=11`;
+
+  // Step 3: Fade in/out
+  chain += `,afade=t=in:st=0:d=${FADE_IN_SEC}`;
+  chain += `,afade=t=out:st=END-${FADE_OUT_SEC}:d=${FADE_OUT_SEC}`;
+
+  return chain;
 }
 
 // ===== Multer =====
@@ -165,26 +225,24 @@ app.post("/upload-video", upload.single("video"), async (req, res) => {
 });
 
 /**
- * 2) Process a batch of clips.
+ * 2) Process a batch of clips with smart hybrid mode support.
  * Body (multipart):
  *   sessionId: string
- *   batchIndex: number (used for output filename offset)
- *   mode: "natural" | "aggressive"  (audio sync strategy)
+ *   batchIndex: number
+ *   mode: "natural" | "aggressive" | "smart_hybrid" (default: smart_hybrid)
  *   clips: JSON string of [{ start, end, index }]
- *   audio: files (one per clip), filename MUST start with "<i>_" matching clip array order
- *
- * For each clip:
- *   - Cut video with -c:v copy -an (no re-encode, perfect quality)
- *   - Build atempo chain from audio_duration / video_duration
- *   - Mux with -c:v copy + AAC audio (-shortest)
- *   - Save as clips/NNNN.mp4 inside session dir
+ *   audio: files
+ *   settings: optional JSON { audioSafeMin, audioSafeMax, loudnessTarget, fadeInSec, fadeOutSec, crf, preset }
  */
 app.post("/process-batch", upload.array("audio", 2000), async (req, res) => {
   const sid = req.body.sessionId as string;
   const batchIndex = Number(req.body.batchIndex || 0);
-  const mode: "natural" | "aggressive" =
-    req.body.mode === "aggressive" ? "aggressive" : "natural";
+  const modeRaw = (req.body.mode || "smart_hybrid") as string;
+  const mode: "natural" | "aggressive" | "smart_hybrid" = 
+    ["natural", "aggressive", "smart_hybrid"].includes(modeRaw) ? 
+    (modeRaw as any) : "smart_hybrid";
   const clipsRaw = req.body.clips as string;
+  const settingsRaw = req.body.settings as string | undefined;
 
   try {
     if (!sid || !clipsRaw) return res.status(400).json({ error: "sessionId + clips required" });
@@ -209,12 +267,19 @@ app.post("/process-batch", upload.array("audio", 2000), async (req, res) => {
     const clipsOut = path.join(dir, "clips");
     await fs.mkdir(clipsOut, { recursive: true });
 
+    // Parse optional settings
+    let settings: any = {};
+    if (settingsRaw) {
+      try {
+        settings = JSON.parse(settingsRaw);
+      } catch {}
+    }
+
     const jobId = `${sid}_b${batchIndex}_${Date.now()}`;
     jobs.set(jobId, { total: clips.length, completed: 0, failed: 0, status: "running", startedAt: Date.now() });
-    // Respond immediately; processing continues in background.
     res.json({ jobId, total: clips.length });
 
-    processInBackground(jobId, source, clips, audioFiles, clipsOut, mode).catch((e) => {
+    processInBackground(jobId, source, clips, audioFiles, clipsOut, mode, dir, settings).catch((e) => {
       const j = jobs.get(jobId);
       if (j) { j.status = "error"; j.error = (e as Error).message; j.finishedAt = Date.now(); }
     });
@@ -229,10 +294,14 @@ async function processInBackground(
   clips: { start: number; end: number; index?: number }[],
   audioFiles: Express.Multer.File[],
   clipsOut: string,
-  mode: "natural" | "aggressive"
+  mode: "natural" | "aggressive" | "smart_hybrid",
+  sessionDir: string,
+  settings: any = {}
 ) {
   const job = jobs.get(jobId)!;
   let cursor = 0;
+  const logs: ClipLog[] = [];
+  const warnings: HybridWarning[] = [];
 
   async function worker() {
     while (true) {
@@ -243,13 +312,19 @@ async function processInBackground(
       const globalIdx = clip.index ?? i;
       const stem = String(globalIdx + 1).padStart(5, "0");
 
+      const clipLog: ClipLog = {
+        clip: globalIdx,
+        start: clip.start,
+        end: clip.end,
+        status: "done",
+      };
+
       try {
-        const tmpClip  = path.join(clipsOut, `.tmp_clip_${stem}.mp4`);
+        const tmpClip = path.join(clipsOut, `.tmp_clip_${stem}.mp4`);
         const tmpAudio = path.join(clipsOut, `.tmp_aud_${stem}.m4a`);
         const finalOut = path.join(clipsOut, `${stem}.mp4`);
 
-        // (1) Cut video without re-encoding. Place -ss after -i for accurate cut with copy
-        // when keyframes don't align we still need accuracy, so use input-seek + output-seek combo.
+        // (1) Cut video without re-encoding
         await run("ffmpeg", [
           "-y",
           "-ss", String(clip.start),
@@ -263,37 +338,92 @@ async function processInBackground(
 
         const videoDur = await probeDuration(tmpClip);
         const audioDur = await probeDuration(audio.path);
-        const tempo = videoDur > 0 ? audioDur / videoDur : 1.0;
-        const { chain } = buildTempoChain(tempo, mode);
+        const requiredTempo = videoDur > 0 ? audioDur / videoDur : 1.0;
 
-        // (2) Adjust audio tempo, encode to AAC
+        clipLog.videoDur = videoDur;
+        clipLog.audioDur = audioDur;
+        clipLog.requiredTempo = requiredTempo;
+
+        let usedAudioTempo = requiredTempo;
+        let videoReencoded = false;
+        let videoSetPtsFactor = 1.0;
+
+        if (mode === "smart_hybrid") {
+          // Smart Hybrid Logic
+          if (requiredTempo >= AUDIO_SAFE_MIN && requiredTempo <= AUDIO_SAFE_MAX) {
+            // Within safe range: audio only
+            usedAudioTempo = requiredTempo;
+            videoReencoded = false;
+          } else {
+            // Outside safe range: clamp audio, adjust video
+            usedAudioTempo = clamp(requiredTempo, AUDIO_SAFE_MIN, AUDIO_SAFE_MAX);
+            const newAudioDur = audioDur / usedAudioTempo;
+            videoSetPtsFactor = newAudioDur / videoDur;
+            videoReencoded = true;
+            warnings.push({
+              clip: globalIdx,
+              requiredTempo,
+              usedAudioTempo,
+              videoReencoded: true,
+              reason: "Audio tempo outside safe range, video re-encoded to match",
+            });
+          }
+        } else {
+          const { effective } = buildTempoChain(requiredTempo, mode);
+          usedAudioTempo = effective;
+        }
+
+        clipLog.usedAudioTempo = usedAudioTempo;
+        clipLog.videoReencoded = videoReencoded;
+
+        // (2) Adjust audio with filter chain (tempo + loudness + fade)
+        const audioFilter = buildAudioFilterChain(usedAudioTempo, mode);
         await run("ffmpeg", [
           "-y", "-i", audio.path,
-          "-filter:a", chain,
+          "-filter:a", audioFilter,
           "-ac", "2", "-ar", "48000",
           "-c:a", "aac", "-b:a", "192k",
           tmpAudio,
         ]);
 
-        // (3) Mux: video copy + new audio, trim to video duration
-        await run("ffmpeg", [
+        // (3) Mux: apply video speed if needed
+        const ffmpegMuxArgs = [
           "-y",
           "-i", tmpClip,
           "-i", tmpAudio,
           "-map", "0:v:0", "-map", "1:a:0",
-          "-c:v", "copy",
-          "-c:a", "aac", "-b:a", "192k",
-          "-shortest",
-          "-movflags", "+faststart",
-          finalOut,
-        ]);
+        ];
+
+        if (videoReencoded) {
+          // Re-encode video with speed adjustment
+          const videoFilter = `setpts=${videoSetPtsFactor}*PTS`;
+          ffmpegMuxArgs.push("-filter:v", videoFilter);
+          ffmpegMuxArgs.push("-c:v", "libx264");
+          ffmpegMuxArgs.push("-crf", String(VIDEO_CRF));
+          ffmpegMuxArgs.push("-preset", VIDEO_PRESET);
+          ffmpegMuxArgs.push("-pix_fmt", "yuv420p");
+        } else {
+          // Copy video as-is
+          ffmpegMuxArgs.push("-c:v", "copy");
+        }
+
+        ffmpegMuxArgs.push("-c:a", "aac", "-b:a", "192k");
+        ffmpegMuxArgs.push("-shortest");
+        ffmpegMuxArgs.push("-movflags", "+faststart");
+        ffmpegMuxArgs.push(finalOut);
+
+        await run("ffmpeg", ffmpegMuxArgs);
 
         await fs.unlink(tmpClip).catch(() => {});
         await fs.unlink(tmpAudio).catch(() => {});
         await fs.unlink(audio.path).catch(() => {});
         job.completed++;
+        logs.push(clipLog);
       } catch (e) {
         job.failed++;
+        clipLog.status = "failed";
+        clipLog.error = (e as Error).message;
+        logs.push(clipLog);
         console.error(`clip ${globalIdx} failed:`, (e as Error).message);
       }
     }
@@ -303,6 +433,16 @@ async function processInBackground(
   await Promise.all(workers);
   job.status = job.failed > 0 && job.completed === 0 ? "error" : "done";
   job.finishedAt = Date.now();
+
+  // Write logs and warnings
+  await fs.writeFile(
+    path.join(sessionDir, "processing_log.json"),
+    JSON.stringify(logs, null, 2)
+  ).catch(() => {});
+  await fs.writeFile(
+    path.join(sessionDir, "warnings.json"),
+    JSON.stringify(warnings, null, 2)
+  ).catch(() => {});
 }
 
 // 3) Job status
@@ -328,7 +468,120 @@ app.get("/download-zip/:sid", async (req, res) => {
   await archive.finalize();
 });
 
-// 5) Direct file fetch (compat with existing frontend)
+// 5) Merge clips into final video
+app.post("/merge/:sid", async (req, res) => {
+  try {
+    const sid = req.params.sid.replace(/[^a-zA-Z0-9_-]/g, "");
+    const sid_dir = sessionDir(sid);
+    const clipsDir = path.join(sid_dir, "clips");
+
+    if (!existsSync(clipsDir)) {
+      return res.status(400).json({ error: "No clips found for session" });
+    }
+
+    const files = await fs.readdir(clipsDir);
+    const mp4Files = files
+      .filter((f) => f.endsWith(".mp4") && !f.startsWith("."))
+      .sort((a, b) => {
+        const numA = parseInt(a.replace(/[^0-9]/g, ""), 10);
+        const numB = parseInt(b.replace(/[^0-9]/g, ""), 10);
+        return numA - numB;
+      });
+
+    if (mp4Files.length === 0) {
+      return res.status(400).json({ error: "No MP4 clips found" });
+    }
+
+    const concatFile = path.join(clipsDir, "concat.txt");
+    const lines = mp4Files.map((f) => `file '${path.join(clipsDir, f)}'`);
+    await fs.writeFile(concatFile, lines.join("\n"));
+
+    const finalOutput = path.join(sid_dir, "final_output.mp4");
+    await run("ffmpeg", [
+      "-f", "concat",
+      "-safe", "0",
+      "-i", concatFile,
+      "-c", "copy",
+      finalOutput,
+    ]);
+
+    await fs.unlink(concatFile).catch(() => {});
+
+    res.json({
+      ok: true,
+      file: "final_output.mp4",
+      downloadUrl: `/file/${sid}/final_output.mp4`,
+    });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// 6) Download final merged video
+app.get("/download-final/:sid", async (req, res) => {
+  try {
+    const sid = req.params.sid.replace(/[^a-zA-Z0-9_-]/g, "");
+    const finalFile = path.join(sessionDir(sid), "final_output.mp4");
+
+    if (!existsSync(finalFile)) {
+      return res.status(404).json({ error: "final_output.mp4 not found" });
+    }
+
+    const stat = await fs.stat(finalFile);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Length", String(stat.size));
+    res.setHeader("Content-Disposition", `attachment; filename="final_output.mp4"`);
+    createReadStream(finalFile).pipe(res);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// 7) Download all (clips + final output + logs)
+app.get("/download-all/:sid", async (req, res) => {
+  try {
+    const sid = req.params.sid.replace(/[^a-zA-Z0-9_-]/g, "");
+    const sid_dir = sessionDir(sid);
+    const clipsDir = path.join(sid_dir, "clips");
+
+    if (!existsSync(clipsDir)) {
+      return res.status(404).json({ error: "No clips for session" });
+    }
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="dubforge_export.zip"`);
+
+    const archive = archiver("zip", { zlib: { level: 6 } });
+    archive.on("error", (err) => { console.error(err); res.status(500).end(); });
+    archive.pipe(res);
+
+    // Add clips
+    archive.directory(clipsDir, "clips");
+
+    // Add final output if exists
+    const finalOutput = path.join(sid_dir, "final_output.mp4");
+    if (existsSync(finalOutput)) {
+      archive.file(finalOutput, { name: "final_output.mp4" });
+    }
+
+    // Add logs if they exist
+    const logFile = path.join(sid_dir, "processing_log.json");
+    if (existsSync(logFile)) {
+      archive.file(logFile, { name: "processing_log.json" });
+    }
+
+    const warningsFile = path.join(sid_dir, "warnings.json");
+    if (existsSync(warningsFile)) {
+      archive.file(warningsFile, { name: "warnings.json" });
+    }
+
+    await archive.finalize();
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// 8) Direct file fetch
 app.get("/file/:sid/:name", async (req, res) => {
   const sid = req.params.sid.replace(/[^a-zA-Z0-9_-]/g, "");
   const name = req.params.name.replace(/[^a-zA-Z0-9_.-]/g, "");
@@ -341,7 +594,7 @@ app.get("/file/:sid/:name", async (req, res) => {
   createReadStream(filePath).pipe(res);
 });
 
-// 6) Cleanup
+// 9) Cleanup
 app.post("/cleanup", async (req, res) => {
   const { sessionId } = req.body as { sessionId: string };
   if (!sessionId) return res.status(400).json({ error: "sessionId required" });
@@ -349,7 +602,7 @@ app.post("/cleanup", async (req, res) => {
   res.json({ ok: true });
 });
 
-// Periodic cleanup
+// Periodic cleanup (24 hours)
 setInterval(async () => {
   try {
     const entries = await fs.readdir(WORK_DIR);
@@ -365,7 +618,12 @@ setInterval(async () => {
 }, 60 * 60 * 1000);
 
 app.listen(PORT, () => {
-  console.log(`DubForge backend on :${PORT} | work=${WORK_DIR} | concurrency=${CONCURRENCY}`);
+  console.log(`DubForge backend on :${PORT}`);
+  console.log(`  work=${WORK_DIR}`);
+  console.log(`  concurrency=${CONCURRENCY}`);
+  console.log(`  mode support: natural | aggressive | smart_hybrid`);
+  console.log(`  loudness target: ${LOUDNESS_TARGET} LUFS`);
+  console.log(`  audio safe range: ${AUDIO_SAFE_MIN}–${AUDIO_SAFE_MAX}`);
 });
 
 // unused helper kept for noUnusedLocals tolerance
