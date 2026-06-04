@@ -20,6 +20,7 @@ ENV FFMPEG_PATH=/usr/bin/ffmpeg
 ENV FFPROBE_PATH=/usr/bin/ffprobe
 ENV STORAGE_DIR=/data
 
+VOLUME ["/data"]
 EXPOSE 8080
 
 CMD ["node", "dist/server.js"]
