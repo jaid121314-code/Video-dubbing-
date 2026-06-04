@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 const PORT = Number(process.env.PORT || 8080);
 const WORK_DIR = process.env.WORK_DIR || path.join(os.tmpdir(), "dubforge");
 const CONCURRENCY = Number(process.env.CONCURRENCY || 8);
+const MAX_FILE_SIZE = 50 * 1024 * 1024 * 1024; // 50GB
 
 // Smart Hybrid & Audio settings
 const AUDIO_SAFE_MIN = Number(process.env.AUDIO_SAFE_MIN || 0.85);
@@ -219,8 +220,8 @@ function buildAudioFilterChainWithFadeOut(
   return chain;
 }
 
-// ===== Multer =====
-const upload = multer({
+// ===== Multer Configuration =====
+const uploadSingle = multer({
   storage: multer.diskStorage({
     destination: async (req, _file, cb) => {
       const sid = (req.body.sessionId || req.query.sessionId || "default") as string;
@@ -233,7 +234,27 @@ const upload = multer({
       cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safe}`);
     },
   }),
-  limits: { fileSize: 50 * 1024 * 1024 * 1024 },
+  limits: { fileSize: MAX_FILE_SIZE },
+  fileFilter: (req, file, cb) => {
+    // Accept any video file type
+    cb(null, true);
+  },
+});
+
+const uploadBatch = multer({
+  storage: multer.diskStorage({
+    destination: async (req, _file, cb) => {
+      const sid = (req.body.sessionId || req.query.sessionId || "default") as string;
+      const dir = path.join(sessionDir(sid), "in");
+      await fs.mkdir(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename: (_req, file, cb) => {
+      const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+      cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safe}`);
+    },
+  }),
+  limits: { fileSize: MAX_FILE_SIZE },
 });
 
 // ===== Endpoints =====
@@ -255,22 +276,70 @@ app.get("/health", (_req, res) => res.json({
   ],
 }));
 
-// 1) Upload base video once per session
-app.post("/upload-video", upload.single("video"), async (req, res) => {
+/**
+ * IMPROVED: Upload base video with better error reporting
+ * Accepts multiple field names: video, videoFile, file
+ * Returns clear error messages
+ */
+app.post("/upload-video", uploadSingle.single("video"), async (req, res) => {
   try {
-    const sid = req.body.sessionId as string;
-    if (!sid || !req.file) return res.status(400).json({ error: "sessionId and video required" });
+    const sid = (req.body.sessionId || req.query.sessionId) as string | undefined;
+    
+    // Error 1: Missing sessionId
+    if (!sid) {
+      return res.status(400).json({
+        error: "Missing sessionId",
+        details: "sessionId is required in FormData (form.append('sessionId', value))",
+        received: { sessionId: req.body.sessionId, querySessionId: req.query.sessionId },
+      });
+    }
+
+    // Error 2: No file received
+    if (!req.file) {
+      return res.status(400).json({
+        error: "No video file received",
+        details: "Expected FormData field 'video' with video file",
+        hints: [
+          "Check that form.append('video', videoBlob, filename) was called",
+          "File must be less than 50GB",
+          "MIME type should be video/* (e.g., video/mp4, video/quicktime)",
+        ],
+        received: {
+          body: Object.keys(req.body),
+          file: req.file ? `${req.file.originalname} (${req.file.size} bytes)` : null,
+        },
+      });
+    }
+
     const dir = sessionDir(sid);
     await fs.mkdir(dir, { recursive: true });
-    // remove any previous source
+    
+    // Remove any previous source
     for (const f of await fs.readdir(dir)) {
-      if (f.startsWith("source")) await fs.unlink(path.join(dir, f)).catch(() => {});
+      if (f.startsWith("source")) {
+        await fs.unlink(path.join(dir, f)).catch(() => {});
+      }
     }
+
+    // Save the file
     const dest = path.join(dir, "source" + path.extname(req.file.originalname));
     await fs.rename(req.file.path, dest);
-    res.json({ ok: true });
+
+    res.json({
+      ok: true,
+      message: "Video uploaded successfully",
+      sessionId: sid,
+      filename: path.basename(dest),
+      size: req.file.size,
+    });
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    const errorMsg = (e as Error).message;
+    console.error("Upload error:", errorMsg);
+    res.status(500).json({
+      error: "Upload failed",
+      message: errorMsg,
+      timestamp: new Date().toISOString(),
+    });
   }
 });
 
@@ -359,8 +428,8 @@ async function processBatchHandler(req: express.Request, res: express.Response) 
   }
 }
 
-app.post("/process-batch", upload.array("audio", 2000), processBatchHandler);
-app.post("/api/batch/process", upload.array("audio", 2000), processBatchHandler);
+app.post("/process-batch", uploadBatch.array("audio", 2000), processBatchHandler);
+app.post("/api/batch/process", uploadBatch.array("audio", 2000), processBatchHandler);
 
 async function processInBackground(
   jobId: string,
