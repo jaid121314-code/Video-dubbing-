@@ -44,6 +44,7 @@ interface ClipLog {
   end?: number;
   videoDur?: number;
   audioDur?: number;
+  adjustedAudioDur?: number;
   requiredTempo?: number;
   usedAudioTempo?: number;
   videoReencoded?: boolean;
@@ -158,6 +159,7 @@ function buildTempoChain(
 
 /**
  * Build audio filter chain for smart_hybrid or natural/aggressive with loudness + fade.
+ * Note: For natural/audio-to-video mode, never re-encode video.
  */
 function buildAudioFilterChain(
   tempo: number,
@@ -180,7 +182,39 @@ function buildAudioFilterChain(
 
   // Step 3: Fade in/out
   chain += `,afade=t=in:st=0:d=${FADE_IN_SEC}`;
-  chain += `,afade=t=out:st=END-${FADE_OUT_SEC}:d=${FADE_OUT_SEC}`;
+  // NOTE: Using END is not supported by FFmpeg. We'll calculate fadeOutStart dynamically.
+  // For now, add a placeholder that we'll replace after probing adjusted duration
+  chain += `,afade=t=out:st=__FADE_OUT_START__:d=${FADE_OUT_SEC}`;
+
+  return chain;
+}
+
+/**
+ * Build final audio filter with fade-out calculated from actual adjusted duration.
+ */
+function buildAudioFilterChainWithFadeOut(
+  tempo: number,
+  mode: "natural" | "aggressive" | "smart_hybrid",
+  adjustedAudioDuration: number
+): string {
+  let chain = "";
+
+  // Step 1: Tempo adjustment
+  if (mode === "smart_hybrid") {
+    const clampedTempo = clamp(tempo, AUDIO_SAFE_MIN, AUDIO_SAFE_MAX);
+    chain = `atempo=${clampedTempo.toFixed(4)}`;
+  } else {
+    const { chain: tempoChain } = buildTempoChain(tempo, mode);
+    chain = tempoChain;
+  }
+
+  // Step 2: Loudness normalization
+  chain += `,loudnorm=I=${LOUDNESS_TARGET}:TP=-1.5:LRA=11`;
+
+  // Step 3: Fade in/out with correct fade-out start
+  chain += `,afade=t=in:st=0:d=${FADE_IN_SEC}`;
+  const fadeOutStart = Math.max(0, adjustedAudioDuration - FADE_OUT_SEC);
+  chain += `,afade=t=out:st=${fadeOutStart}:d=${FADE_OUT_SEC}`;
 
   return chain;
 }
@@ -203,7 +237,23 @@ const upload = multer({
 });
 
 // ===== Endpoints =====
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get("/health", (_req, res) => res.json({
+  ok: true,
+  ffmpeg: true,
+  ffprobe: true,
+  routes: [
+    "/upload-video",
+    "/process-batch",
+    "/api/batch/process",
+    "/job/:id",
+    "/download-zip/:sid",
+    "/download-final/:sid",
+    "/download-all/:sid",
+    "/merge/:sid",
+    "/file/:sid/:name",
+    "/cleanup"
+  ],
+}));
 
 // 1) Upload base video once per session
 app.post("/upload-video", upload.single("video"), async (req, res) => {
@@ -225,22 +275,43 @@ app.post("/upload-video", upload.single("video"), async (req, res) => {
 });
 
 /**
+ * Normalize mode from frontend: accept both "syncMode" and "mode"
+ * Mapping: "audio-to-video" => "natural", others stay as-is
+ * Default to "natural" for stable first testing
+ */
+function normalizeMode(syncMode?: string, mode?: string): "natural" | "aggressive" | "smart_hybrid" {
+  // Try syncMode first
+  if (syncMode) {
+    if (syncMode === "audio-to-video") return "natural";
+    if (syncMode === "smart_hybrid") return "smart_hybrid";
+  }
+  
+  // Try mode second
+  if (mode) {
+    if (mode === "natural") return "natural";
+    if (mode === "aggressive") return "aggressive";
+    if (mode === "smart_hybrid") return "smart_hybrid";
+  }
+  
+  // Default to natural for stable first testing
+  return "natural";
+}
+
+/**
  * 2) Process a batch of clips with smart hybrid mode support.
  * Body (multipart):
  *   sessionId: string
  *   batchIndex: number
- *   mode: "natural" | "aggressive" | "smart_hybrid" (default: smart_hybrid)
+ *   mode or syncMode: "natural" | "aggressive" | "smart_hybrid" (default: natural)
  *   clips: JSON string of [{ start, end, index }]
  *   audio: files
  *   settings: optional JSON { audioSafeMin, audioSafeMax, loudnessTarget, fadeInSec, fadeOutSec, crf, preset }
  */
-app.post("/process-batch", upload.array("audio", 2000), async (req, res) => {
+async function processBatchHandler(req: express.Request, res: express.Response) {
   const sid = req.body.sessionId as string;
   const batchIndex = Number(req.body.batchIndex || 0);
-  const modeRaw = (req.body.mode || "smart_hybrid") as string;
-  const mode: "natural" | "aggressive" | "smart_hybrid" = 
-    ["natural", "aggressive", "smart_hybrid"].includes(modeRaw) ? 
-    (modeRaw as any) : "smart_hybrid";
+  const syncMode = (req.body.syncMode || req.body.mode) as string | undefined;
+  const processMode = normalizeMode(syncMode, req.body.mode);
   const clipsRaw = req.body.clips as string;
   const settingsRaw = req.body.settings as string | undefined;
 
@@ -279,14 +350,17 @@ app.post("/process-batch", upload.array("audio", 2000), async (req, res) => {
     jobs.set(jobId, { total: clips.length, completed: 0, failed: 0, status: "running", startedAt: Date.now() });
     res.json({ jobId, total: clips.length });
 
-    processInBackground(jobId, source, clips, audioFiles, clipsOut, mode, dir, settings).catch((e) => {
+    processInBackground(jobId, source, clips, audioFiles, clipsOut, processMode, dir, settings).catch((e) => {
       const j = jobs.get(jobId);
       if (j) { j.status = "error"; j.error = (e as Error).message; j.finishedAt = Date.now(); }
     });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }
-});
+}
+
+app.post("/process-batch", upload.array("audio", 2000), processBatchHandler);
+app.post("/api/batch/process", upload.array("audio", 2000), processBatchHandler);
 
 async function processInBackground(
   jobId: string,
@@ -322,6 +396,7 @@ async function processInBackground(
       try {
         const tmpClip = path.join(clipsOut, `.tmp_clip_${stem}.mp4`);
         const tmpAudio = path.join(clipsOut, `.tmp_aud_${stem}.m4a`);
+        const tmpAudioProcessed = path.join(clipsOut, `.tmp_aud_proc_${stem}.m4a`);
         const finalOut = path.join(clipsOut, `${stem}.mp4`);
 
         // (1) Cut video without re-encoding
@@ -368,34 +443,59 @@ async function processInBackground(
               reason: "Audio tempo outside safe range, video re-encoded to match",
             });
           }
+        } else if (mode === "natural") {
+          // Natural mode: never re-encode video, always keep video copy
+          usedAudioTempo = clamp(requiredTempo, AUDIO_SAFE_MIN, AUDIO_SAFE_MAX);
+          videoReencoded = false;
         } else {
+          // aggressive mode
           const { effective } = buildTempoChain(requiredTempo, mode);
           usedAudioTempo = effective;
+          videoReencoded = false;
         }
 
         clipLog.usedAudioTempo = usedAudioTempo;
         clipLog.videoReencoded = videoReencoded;
 
-        // (2) Adjust audio with filter chain (tempo + loudness + fade)
-        const audioFilter = buildAudioFilterChain(usedAudioTempo, mode);
+        // (2a) Adjust audio with tempo + loudnorm (two-pass for loudnorm)
+        // First pass: apply tempo and loudnorm
+        const tempFilter = `atempo=${usedAudioTempo.toFixed(4)},loudnorm=I=${LOUDNESS_TARGET}:TP=-1.5:LRA=11`;
         await run("ffmpeg", [
           "-y", "-i", audio.path,
-          "-filter:a", audioFilter,
+          "-filter:a", tempFilter,
           "-ac", "2", "-ar", "48000",
           "-c:a", "aac", "-b:a", "192k",
           tmpAudio,
+        ]);
+
+        // (2b) Probe adjusted audio duration
+        const adjustedAudioDur = await probeDuration(tmpAudio);
+        clipLog.adjustedAudioDur = adjustedAudioDur;
+
+        // (2c) Now apply fade-in and fade-out with correct start time
+        const fadeOutStart = Math.max(0, adjustedAudioDur - FADE_OUT_SEC);
+        const fadeFilter = `afade=t=in:st=0:d=${FADE_IN_SEC},afade=t=out:st=${fadeOutStart}:d=${FADE_OUT_SEC}`;
+        await run("ffmpeg", [
+          "-y", "-i", tmpAudio,
+          "-filter:a", fadeFilter,
+          "-ac", "2", "-ar", "48000",
+          "-c:a", "aac", "-b:a", "192k",
+          tmpAudioProcessed,
         ]);
 
         // (3) Mux: apply video speed if needed
         const ffmpegMuxArgs = [
           "-y",
           "-i", tmpClip,
-          "-i", tmpAudio,
+          "-i", tmpAudioProcessed,
           "-map", "0:v:0", "-map", "1:a:0",
         ];
 
-        if (videoReencoded) {
-          // Re-encode video with speed adjustment
+        if (mode === "natural") {
+          // Natural mode: ALWAYS copy video, never re-encode
+          ffmpegMuxArgs.push("-c:v", "copy");
+        } else if (videoReencoded) {
+          // Smart hybrid with video re-encode
           const videoFilter = `setpts=${videoSetPtsFactor}*PTS`;
           ffmpegMuxArgs.push("-filter:v", videoFilter);
           ffmpegMuxArgs.push("-c:v", "libx264");
@@ -416,6 +516,7 @@ async function processInBackground(
 
         await fs.unlink(tmpClip).catch(() => {});
         await fs.unlink(tmpAudio).catch(() => {});
+        await fs.unlink(tmpAudioProcessed).catch(() => {});
         await fs.unlink(audio.path).catch(() => {});
         job.completed++;
         logs.push(clipLog);
@@ -621,9 +722,10 @@ app.listen(PORT, () => {
   console.log(`DubForge backend on :${PORT}`);
   console.log(`  work=${WORK_DIR}`);
   console.log(`  concurrency=${CONCURRENCY}`);
-  console.log(`  mode support: natural | aggressive | smart_hybrid`);
+  console.log(`  mode support: natural (default) | aggressive | smart_hybrid`);
   console.log(`  loudness target: ${LOUDNESS_TARGET} LUFS`);
   console.log(`  audio safe range: ${AUDIO_SAFE_MIN}–${AUDIO_SAFE_MAX}`);
+  console.log(`  fade in/out: ${FADE_IN_SEC}s / ${FADE_OUT_SEC}s`);
 });
 
 // unused helper kept for noUnusedLocals tolerance
