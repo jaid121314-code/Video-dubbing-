@@ -3,9 +3,35 @@
 Fast, parallel FFmpeg pipeline that replaces narration on a long-form video **without unnecessary re-encoding**. 
 Output is individual dubbed MP4 clips at original quality, merged into a final video with comprehensive logging.
 
+## What's New (v3.1)
+
+✨ **Fixed FFmpeg Fade-Out Bug**:
+- Corrected fade-out filter: now probes adjusted audio duration and calculates correct start time
+- No longer uses unsupported "END" keyword
+- Applies tempo → loudnorm → probe duration → fade-in/out in correct sequence
+
+✨ **Frontend Field Flexibility**:
+- Accepts both `syncMode` and `mode` fields from frontend
+- Maps `"audio-to-video"` → `"natural"` mode automatically
+- Default mode is now `"natural"` for stable first testing
+
+✨ **Natural Mode (Audio-to-Video) Optimization**:
+- Never re-encodes video, always uses `-c:v copy`
+- Adjusts audio tempo only
+- Uses loudnorm and fade-in/fade-out filters
+- Fast and lossless video processing
+
+✨ **Route Alias for Safety**:
+- `POST /api/batch/process` now aliases to same handler as `POST /process-batch`
+- Prevents frontend route mismatch errors
+
+✨ **Enhanced Health Endpoint**:
+- Returns detailed status: `ok`, `ffmpeg`, `ffprobe` flags
+- Lists all available routes for client discovery
+
 ## What's New (v3)
 
-✨ **Smart Hybrid Mode** (default):
+✨ **Smart Hybrid Mode** (still available, not default):
 - Analyzes each clip's audio/video duration mismatch
 - If mismatch is natural (0.85–1.25×): adjusts audio tempo only, keeps video copied
 - If mismatch is extreme: clamps audio to safe range, re-encodes video only for that clip
@@ -30,7 +56,25 @@ Output is individual dubbed MP4 clips at original quality, merged into a final v
 - `processing_log.json` — per-clip details (tempo, duration, re-encode status)
 - `warnings.json` — clips that triggered smart hybrid video re-encoding
 
-## How Smart Hybrid Works
+## How Natural Mode Works (Default)
+
+For each clip:
+
+```
+videoDur = duration of cut video clip
+audioDur = duration of narration audio
+requiredTempo = audioDur / videoDur
+
+✅ Clamp audio tempo to [0.85, 1.25]
+✅ Keep video untouched (use -c:v copy)
+✅ Adjust audio tempo only
+❌ NO video re-encoding
+✅ Apply loudnorm + fade-in/fade-out on audio
+```
+
+**Result:** All clips use `-c:v copy` (instant, lossless, high-quality narration).
+
+## How Smart Hybrid Works (Optional)
 
 For each clip:
 
@@ -58,9 +102,10 @@ IF requiredTempo < 0.85 OR requiredTempo > 1.25 THEN
 
 | Method | Path | Purpose |
 |--------|------|----------|
-| GET | `/health` | Liveness check |
+| GET | `/health` | Liveness check + available routes |
 | POST | `/upload-video` | multipart: `sessionId`, `video` (1 file) |
-| POST | `/process-batch` | multipart: `sessionId`, `batchIndex`, `mode`, `clips` (JSON), `audio[]` |
+| POST | `/process-batch` | multipart: `sessionId`, `batchIndex`, `mode/syncMode`, `clips` (JSON), `audio[]` |
+| POST | `/api/batch/process` | Alias for `/process-batch` (route safety) |
 | GET | `/job/:id` | Poll progress: `{ total, completed, failed, status }` |
 | POST | `/merge/:sid` | Concatenate all processed clips → `final_output.mp4` |
 | GET | `/download-final/:sid` | Stream `final_output.mp4` |
@@ -69,17 +114,47 @@ IF requiredTempo < 0.85 OR requiredTempo > 1.25 THEN
 | GET | `/file/:sid/:name` | Download any file from session |
 | POST | `/cleanup` | Delete a session's working files |
 
+### GET /health
+
+**Response:**
+```json
+{
+  "ok": true,
+  "ffmpeg": true,
+  "ffprobe": true,
+  "routes": [
+    "/upload-video",
+    "/process-batch",
+    "/api/batch/process",
+    "/job/:id",
+    "/download-zip/:sid",
+    "/download-final/:sid",
+    "/download-all/:sid",
+    "/merge/:sid",
+    "/file/:sid/:name",
+    "/cleanup"
+  ]
+}
+```
+
 ### POST /process-batch
 
 **Multipart Form:**
 ```
 sessionId:   string (required)
 batchIndex:  number (optional, default 0)
-mode:        "natural" | "aggressive" | "smart_hybrid" (default: smart_hybrid)
+mode:        "natural" | "aggressive" | "smart_hybrid" (default: natural)
+syncMode:    (alternative to mode) "audio-to-video" → "natural", "smart_hybrid" → "smart_hybrid"
 clips:       JSON string of [{ "start": 5.43, "end": 10.86, "index": 0 }, ...]
 settings:    optional JSON {"audioSafeMin": 0.85, "audioSafeMax": 1.25, "loudnessTarget": -16, ...}
 audio:       1 or more files (must match clips count)
 ```
+
+**Frontend Field Mapping:**
+- Send either `mode` or `syncMode` (both work)
+- `"audio-to-video"` → backend maps to `"natural"`
+- `"smart_hybrid"` → stays as `"smart_hybrid"`
+- Default if neither provided: `"natural"`
 
 **Response:** `{ "jobId": "...", "total": 5 }`
 
@@ -99,6 +174,7 @@ Merges all clips in `clips/` directory into `final_output.mp4`.
     "end": 10.86,
     "videoDur": 5.43,
     "audioDur": 6.73,
+    "adjustedAudioDur": 6.73,
     "requiredTempo": 1.24,
     "usedAudioTempo": 1.24,
     "videoReencoded": false,
@@ -108,6 +184,7 @@ Merges all clips in `clips/` directory into `final_output.mp4`.
     "clip": 1,
     "videoDur": 3.5,
     "audioDur": 5.2,
+    "adjustedAudioDur": 5.0,
     "requiredTempo": 1.49,
     "usedAudioTempo": 1.25,
     "videoReencoded": true,
@@ -196,32 +273,33 @@ ffprobe -version
 
 ## Audio Sync Modes
 
-Send `mode` in `/process-batch`:
+Send `mode` or `syncMode` in `/process-batch`:
 
-### `smart_hybrid` (default, recommended)
-- **Prioritizes quality & speed**: Keeps video copied when possible.
-- Audio tempo clamped to [0.85, 1.25].
+### `natural` (default, recommended for first testing)
+- **Prioritizes voice quality & speed**: Audio tempo stays within natural-sounding range [0.85, 1.25].
+- Video is never re-encoded (always `-c:v copy`).
+- Fast and lossless for video.
+- Best for stable, reliable dubbing with highest voice quality.
+
+### `smart_hybrid` (optional, for extreme mismatches)
+- **Prioritizes matching**: Keeps video copied when possible, re-encodes only when audio tempo is outside [0.85, 1.25].
 - If required tempo is outside range: clamps audio, re-encodes video only.
-- Best for most use cases.
+- Best if some clips have extreme duration mismatches.
 
-### `natural`
-- **Prioritizes voice quality**: Audio tempo stays within natural-sounding range [0.85, 1.20].
-- If audio can't fit exactly, video remains untouched and muxer trims via `-shortest`.
-- Good for strict quality requirements.
-
-### `aggressive`
+### `aggressive` (deprecated, use with caution)
 - **Prioritizes exact timing**: Chains atempo filters to hit any target (within [0.5, 2.0]).
 - Voice may sound robotic at extreme speeds.
-- Use only when exact sync is mandatory.
+- Use only when exact sync is mandatory and narration quality is not critical.
 
 ## Quality Guarantees
 
-✅ **Normal Clips** (smart_hybrid, within safe range):
+✅ **Natural Mode Clips** (default):
 - `-c:v copy` (zero re-encoding, lossless)
 - Original codec, resolution, bitrate, FPS preserved
 - Instant processing
+- Narration tempo clamped to natural range [0.85–1.25]
 
-✅ **Re-encoded Clips** (smart_hybrid, outside safe range):
+✅ **Re-encoded Clips** (smart_hybrid only, outside safe range):
 - `-c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p`
 - Resolution preserved, zero crop/resize
 - FPS preserved
@@ -248,6 +326,26 @@ After `/process-batch` + `/merge/:sid`:
 └── warnings.json             # re-encoded clip warnings
 ```
 
+## Multi-Backend Deployment (Important ⚠️)
+
+**If batches are processed on multiple Railway backends**, each backend only has its own clips in its `/data` volume.
+
+**Problem:** Final merge into one MP4 works only when:
+- ✅ All clips are on one backend, OR
+- ✅ Frontend collects all batch ZIPs and sends all clips to one merge backend
+
+**Solution for Multi-Backend Setup:**
+1. Frontend processes batch 1 on Backend A → clips in `/data/sessionId/clips/` on A
+2. Frontend processes batch 2 on Backend B → clips in `/data/sessionId/clips/` on B
+3. **To merge:** Frontend must:
+   - Download all clips from Backend A (`/download-zip/:sid`)
+   - Download all clips from Backend B (`/download-zip/:sid`)
+   - Extract both ZIPs
+   - Upload extracted clips to one backend
+   - Call `/merge/:sid` on that backend
+
+**Recommended:** Use a single backend for all batches of one session, or implement frontend logic to collect and consolidate clips before merge.
+
 ## Troubleshooting
 
 ### Merge fails: "Codec mismatch"
@@ -261,28 +359,34 @@ After `/process-batch` + `/merge/:sid`:
 - Manually re-process that clip.
 
 ### Video speed sounds weird
-- Check `warnings.json`—video may be re-encoded.
-- Adjust `AUDIO_SAFE_MAX` or `AUDIO_SAFE_MIN` env vars (affects when video re-encoding triggers).
-- Or switch to `aggressive` mode for smoother audio behavior (trade-off: may be slower/robotic).
+- Check `processing_log.json` — check `usedAudioTempo` field.
+- If `videoReencoded` is `true`, video may have been re-encoded (smart_hybrid mode only).
+- In natural mode, video is never re-encoded; audio tempo is clamped instead.
 
 ### Clips are huge; can I lower quality?
 - `VIDEO_CRF`: Higher value = lower quality. Default 18 is high quality; try 22–26 for smaller files.
 - `VIDEO_PRESET`: Slower preset = smaller file. Default is veryfast; try `fast` or `medium`.
-- Or accept that normal clips use `-c:v copy` and only re-encoded clips vary in size.
+- Or accept that natural mode clips use `-c:v copy` and only re-encoded clips vary in size (smart_hybrid only).
+
+### Fade-out clicks or pops
+- Fade times are very short (0.03 sec default) by design.
+- Increase `FADE_OUT_SEC` env var (e.g., `0.1`) if needed.
+- Ensure loudnorm is applied before fades (pipeline order matters).
 
 ## API Compatibility
 
 - Old endpoints (`/download-zip/:sid`, `/file/:sid/:name`) still work.
-- Default `/process-batch` mode is now `smart_hybrid` (was `natural`).
+- Default `/process-batch` mode is now `natural` (was `smart_hybrid` in v3).
 - Settings JSON is optional; all defaults work out of the box.
-- No breaking changes to existing frontend.
+- Backend now accepts both `mode` and `syncMode` fields; no breaking changes.
 
 ## Performance
 
-- **8 parallel workers, normal clips**: ~5–10 clips/sec (depending on video duration & CPU).
+- **Natural mode, all clips**: ~5–10 clips/sec (depending on video duration & CPU).
+- **Smart hybrid, mostly normal clips**: ~5–10 clips/sec.
 - **Smart hybrid with re-encoding**: Re-encoded clips slower (~30 sec per clip @ 1080p/CRF18).
 - **Merge**: 2–5 min depending on total duration (fast, no re-encode).
-- **Total for 10 clips (1× re-encoded)**: ~2–3 min processing + merge.
+- **Total for 10 natural-mode clips**: ~1–2 min processing + merge.
 
 ## License
 
