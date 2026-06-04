@@ -278,7 +278,7 @@ app.get("/health", (_req, res) => res.json({
 
 /**
  * IMPROVED: Upload base video with better error reporting
- * Accepts multiple field names: video, videoFile, file
+ * Accepts field name: video
  * Returns clear error messages
  */
 app.post("/upload-video", uploadSingle.single("video"), async (req, res) => {
@@ -296,6 +296,7 @@ app.post("/upload-video", uploadSingle.single("video"), async (req, res) => {
 
     // Error 2: No file received
     if (!req.file) {
+      const bodyKeys = Object.keys(req.body);
       return res.status(400).json({
         error: "No video file received",
         details: "Expected FormData field 'video' with video file",
@@ -305,8 +306,8 @@ app.post("/upload-video", uploadSingle.single("video"), async (req, res) => {
           "MIME type should be video/* (e.g., video/mp4, video/quicktime)",
         ],
         received: {
-          body: Object.keys(req.body),
-          file: req.file ? `${req.file.originalname} (${req.file.size} bytes)` : null,
+          body: bodyKeys,
+          file: null,
         },
       });
     }
