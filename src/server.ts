@@ -107,6 +107,18 @@ function clamp(val: number, min: number, max: number): number {
 }
 
 /**
+ * Extract session ID from multiple sources (FormData, query params, headers)
+ * Priority: FormData > query params > headers
+ */
+function extractSessionId(req: express.Request): string | undefined {
+  return (
+    (req.body.sessionId as string | undefined) ||
+    (req.query.sessionId as string | undefined) ||
+    (req.headers["x-session-id"] as string | undefined)
+  );
+}
+
+/**
  * Build an atempo filter chain for natural/aggressive modes.
  * For smart_hybrid, this is handled separately.
  */
@@ -224,7 +236,7 @@ function buildAudioFilterChainWithFadeOut(
 const uploadSingle = multer({
   storage: multer.diskStorage({
     destination: async (req, _file, cb) => {
-      const sid = (req.body.sessionId || req.query.sessionId || "default") as string;
+      const sid = extractSessionId(req) || "default";
       const dir = path.join(sessionDir(sid), "in");
       await fs.mkdir(dir, { recursive: true });
       cb(null, dir);
@@ -244,7 +256,7 @@ const uploadSingle = multer({
 const uploadBatch = multer({
   storage: multer.diskStorage({
     destination: async (req, _file, cb) => {
-      const sid = (req.body.sessionId || req.query.sessionId || "default") as string;
+      const sid = extractSessionId(req) || "default";
       const dir = path.join(sessionDir(sid), "in");
       await fs.mkdir(dir, { recursive: true });
       cb(null, dir);
@@ -279,18 +291,23 @@ app.get("/health", (_req, res) => res.json({
 /**
  * IMPROVED: Upload base video with better error reporting
  * Accepts field name: video
+ * Accepts sessionId from FormData, query params, or headers
  * Returns clear error messages
  */
 app.post("/upload-video", uploadSingle.single("video"), async (req, res) => {
   try {
-    const sid = (req.body.sessionId || req.query.sessionId) as string | undefined;
+    const sid = extractSessionId(req);
     
     // Error 1: Missing sessionId
     if (!sid) {
       return res.status(400).json({
         error: "Missing sessionId",
-        details: "sessionId is required in FormData (form.append('sessionId', value))",
-        received: { sessionId: req.body.sessionId, querySessionId: req.query.sessionId },
+        details: "sessionId is required from one of: FormData field, query param, or X-Session-ID header",
+        received: {
+          formData: req.body.sessionId || null,
+          queryParam: req.query.sessionId || null,
+          header: req.headers["x-session-id"] || null,
+        },
       });
     }
 
@@ -370,7 +387,7 @@ function normalizeMode(syncMode?: string, mode?: string): "natural" | "aggressiv
 /**
  * 2) Process a batch of clips with smart hybrid mode support.
  * Body (multipart):
- *   sessionId: string
+ *   sessionId: string (also accepts from query params or X-Session-ID header)
  *   batchIndex: number
  *   mode or syncMode: "natural" | "aggressive" | "smart_hybrid" (default: natural)
  *   clips: JSON string of [{ start, end, index }]
@@ -378,7 +395,7 @@ function normalizeMode(syncMode?: string, mode?: string): "natural" | "aggressiv
  *   settings: optional JSON { audioSafeMin, audioSafeMax, loudnessTarget, fadeInSec, fadeOutSec, crf, preset }
  */
 async function processBatchHandler(req: express.Request, res: express.Response) {
-  const sid = req.body.sessionId as string;
+  const sid = extractSessionId(req);
   const batchIndex = Number(req.body.batchIndex || 0);
   const syncMode = (req.body.syncMode || req.body.mode) as string | undefined;
   const processMode = normalizeMode(syncMode, req.body.mode);
@@ -386,14 +403,32 @@ async function processBatchHandler(req: express.Request, res: express.Response) 
   const settingsRaw = req.body.settings as string | undefined;
 
   try {
-    if (!sid || !clipsRaw) return res.status(400).json({ error: "sessionId + clips required" });
+    // Error: Missing sessionId
+    if (!sid) {
+      return res.status(400).json({
+        error: "Missing sessionId",
+        details: "sessionId is required from one of: FormData field, query param, or X-Session-ID header",
+        received: {
+          formData: req.body.sessionId || null,
+          queryParam: req.query.sessionId || null,
+          header: req.headers["x-session-id"] || null,
+        },
+      });
+    }
+
+    if (!clipsRaw) {
+      return res.status(400).json({ error: "clips required (JSON string)" });
+    }
+
     const clips: { start: number; end: number; index?: number }[] = JSON.parse(clipsRaw);
     const audioFiles = (req.files as Express.Multer.File[]) || [];
+    
     if (audioFiles.length !== clips.length) {
       return res.status(400).json({
         error: `Audio count ${audioFiles.length} != clips ${clips.length}`,
       });
     }
+
     audioFiles.sort((a, b) => {
       const ai = parseInt(a.originalname.split("_")[0], 10);
       const bi = parseInt(b.originalname.split("_")[0], 10);
@@ -401,10 +436,22 @@ async function processBatchHandler(req: express.Request, res: express.Response) 
     });
 
     const dir = sessionDir(sid);
-    const sourceCandidates = (await fs.readdir(dir)).filter((f) => f.startsWith("source"));
-    if (!sourceCandidates.length) return res.status(400).json({ error: "Source video not uploaded" });
-    const source = path.join(dir, sourceCandidates[0]);
+    
+    // Check if source video exists on this backend
+    const sourceCandidates = (await fs.readdir(dir).catch(() => [])).filter((f) => f.startsWith("source"));
+    if (!sourceCandidates.length) {
+      return res.status(400).json({
+        error: "Source video not found on this backend",
+        details: `Session "${sid}" exists but source video was not uploaded to this backend instance`,
+        hints: [
+          "Ensure /upload-video was called on the same backend before /process-batch",
+          "For multi-backend deployments: process batches only on the backend that has the uploaded video",
+          "Check that sessionId matches exactly between upload and batch requests",
+        ],
+      });
+    }
 
+    const source = path.join(dir, sourceCandidates[0]);
     const clipsOut = path.join(dir, "clips");
     await fs.mkdir(clipsOut, { recursive: true });
 
@@ -796,6 +843,7 @@ app.listen(PORT, () => {
   console.log(`  loudness target: ${LOUDNESS_TARGET} LUFS`);
   console.log(`  audio safe range: ${AUDIO_SAFE_MIN}–${AUDIO_SAFE_MAX}`);
   console.log(`  fade in/out: ${FADE_IN_SEC}s / ${FADE_OUT_SEC}s`);
+  console.log(`  sessionId accepted from: FormData, query params, X-Session-ID header`);
 });
 
 // unused helper kept for noUnusedLocals tolerance
