@@ -91,13 +91,7 @@ app.post("/api/upload-zip/:jobId", (req, res, next) => {
 app.post("/api/process/:jobId", async (req, res) => {
   const r = withJob(req, res); if (!r.ok) return;
   const job = r.job;
-  const {
-    keepBackgroundMusic = false,
-    backgroundVolume = 0.15,
-    mode = "manhua",
-    batchSize = 100,
-    loudnessLufs = -16,
-  } = req.body ?? {};
+  const { keepBackgroundMusic = false, backgroundVolume = 0.15 } = req.body ?? {};
 
   if (!job.assets.videoPath || !job.assets.srtPath || !job.assets.zipPath) {
     return res.status(400).json({ error: "Missing video, srt, or zip upload" });
@@ -124,9 +118,6 @@ app.post("/api/process/:jobId", async (req, res) => {
         throw new Error(`Mismatch: ${segments.length} SRT segments vs ${audioFiles.length} audio files`);
       }
 
-      const safeBatch = Math.max(1, Math.min(500, Number(batchSize) || 100));
-      const safeLufs = Math.max(-30, Math.min(-9, Number(loudnessLufs) || -16));
-
       await processJob({
         jobId: job.id,
         workDir: job.workDir,
@@ -135,9 +126,6 @@ app.post("/api/process/:jobId", async (req, res) => {
         audioFiles,
         keepBackgroundMusic: !!keepBackgroundMusic,
         backgroundVolume: Number(backgroundVolume) || 0.15,
-        mode: mode === "anime" ? "anime" : "manhua",
-        batchSize: safeBatch,
-        loudnessLufs: safeLufs,
         store,
       });
     } catch (e: any) {
@@ -157,8 +145,6 @@ app.get("/api/status/:jobId", (req, res) => {
     error: j.error,
     processedSegments: j.processedSegments,
     totalSegments: j.totalSegments,
-    currentBatch: j.currentBatch,
-    totalBatches: j.totalBatches,
     preview: j.preview,
     hasOutput: !!j.finalPath,
   });

@@ -36,8 +36,6 @@ export interface Job {
   assets: JobAssets;
   processedSegments?: number;
   totalSegments?: number;
-  currentBatch?: number;
-  totalBatches?: number;
   preview?: JobPreview[];
   finalPath?: string;
 }
