@@ -1,393 +1,49 @@
-# DubForge Backend (v3 — Smart Hybrid Sync + Merge)
+# AutoDub Sync Studio — Backend
 
-Fast, parallel FFmpeg pipeline that replaces narration on a long-form video **without unnecessary re-encoding**. 
-Output is individual dubbed MP4 clips at original quality, merged into a final video with comprehensive logging.
-
-## What's New (v3.1)
-
-✨ **Fixed FFmpeg Fade-Out Bug**:
-- Corrected fade-out filter: now probes adjusted audio duration and calculates correct start time
-- No longer uses unsupported "END" keyword
-- Applies tempo → loudnorm → probe duration → fade-in/out in correct sequence
-
-✨ **Frontend Field Flexibility**:
-- Accepts both `syncMode` and `mode` fields from frontend
-- Maps `"audio-to-video"` → `"natural"` mode automatically
-- Default mode is now `"natural"` for stable first testing
-
-✨ **Natural Mode (Audio-to-Video) Optimization**:
-- Never re-encodes video, always uses `-c:v copy`
-- Adjusts audio tempo only
-- Uses loudnorm and fade-in/fade-out filters
-- Fast and lossless video processing
-
-✨ **Route Alias for Safety**:
-- `POST /api/batch/process` now aliases to same handler as `POST /process-batch`
-- Prevents frontend route mismatch errors
-
-✨ **Enhanced Health Endpoint**:
-- Returns detailed status: `ok`, `ffmpeg`, `ffprobe` flags
-- Lists all available routes for client discovery
-
-## What's New (v3)
-
-✨ **Smart Hybrid Mode** (still available, not default):
-- Analyzes each clip's audio/video duration mismatch
-- If mismatch is natural (0.85–1.25×): adjusts audio tempo only, keeps video copied
-- If mismatch is extreme: clamps audio to safe range, re-encodes video only for that clip
-- Generates warnings for re-encoded clips
-
-✨ **Loudness Normalization**:
-- All narration audio normalized to -16 LUFS (configurable)
-- Prevents audio level jumps between clips
-- Uses FFmpeg `loudnorm` filter
-
-✨ **Audio Fades**:
-- Tiny fade-in (0.03 sec) and fade-out (0.03 sec) on every narration track
-- Eliminates clicks, pops, and glitches
-- Fully configurable
-
-✨ **Merge Endpoint**:
-- `/merge/:sid` — concatenates all processed clips into `final_output.mp4`
-- `/download-final/:sid` — direct download of merged video
-- `/download-all/:sid` — ZIP with clips + final video + logs
-
-✨ **Comprehensive Logging**:
-- `processing_log.json` — per-clip details (tempo, duration, re-encode status)
-- `warnings.json` — clips that triggered smart hybrid video re-encoding
-
-## How Natural Mode Works (Default)
-
-For each clip:
-
-```
-videoDur = duration of cut video clip
-audioDur = duration of narration audio
-requiredTempo = audioDur / videoDur
-
-✅ Clamp audio tempo to [0.85, 1.25]
-✅ Keep video untouched (use -c:v copy)
-✅ Adjust audio tempo only
-❌ NO video re-encoding
-✅ Apply loudnorm + fade-in/fade-out on audio
-```
-
-**Result:** All clips use `-c:v copy` (instant, lossless, high-quality narration).
-
-## How Smart Hybrid Works (Optional)
-
-For each clip:
-
-```
-videoDur = duration of cut video clip
-audioDur = duration of narration audio
-requiredTempo = audioDur / videoDur
-
-IF 0.85 ≤ requiredTempo ≤ 1.25 THEN
-  ✅ Keep video untouched (use -c:v copy)
-  ✅ Adjust audio tempo only
-  ❌ NO video re-encoding
-
-IF requiredTempo < 0.85 OR requiredTempo > 1.25 THEN
-  ✅ Clamp audio tempo to [0.85, 1.25]
-  ✅ Calculate adjusted audio duration
-  ✅ Speed up/down video to match
-  ⚠️  RE-ENCODE VIDEO (once per affected clip)
-  📋 Log warning
-```
-
-**Result:** Most clips use `-c:v copy` (instant, lossless). Only clips with extreme mismatch are re-encoded at high quality (CRF 18, veryfast preset).
+Node.js + TypeScript + Express + FFmpeg backend for AutoDub Sync Studio. Cuts a source video by an SRT, swaps each segment's audio with a matching narration clip, speed-adjusts video to match narration duration exactly, and concatenates everything into a final dubbed MP4.
 
 ## Endpoints
 
+All endpoints are JSON unless noted.
+
 | Method | Path | Purpose |
-|--------|------|----------|
-| GET | `/health` | Liveness check + available routes |
-| POST | `/upload-video` | multipart: `sessionId`, `video` (1 file) |
-| POST | `/process-batch` | multipart: `sessionId`, `batchIndex`, `mode/syncMode`, `clips` (JSON), `audio[]` |
-| POST | `/api/batch/process` | Alias for `/process-batch` (route safety) |
-| GET | `/job/:id` | Poll progress: `{ total, completed, failed, status }` |
-| POST | `/merge/:sid` | Concatenate all processed clips → `final_output.mp4` |
-| GET | `/download-final/:sid` | Stream `final_output.mp4` |
-| GET | `/download-zip/:sid` | Stream ZIP of all processed clips (legacy) |
-| GET | `/download-all/:sid` | Stream ZIP: `clips/`, `final_output.mp4`, `processing_log.json`, `warnings.json` |
-| GET | `/file/:sid/:name` | Download any file from session |
-| POST | `/cleanup` | Delete a session's working files |
+|---|---|---|
+| `GET`  | `/api/health` | Liveness check |
+| `POST` | `/api/jobs` | Create a new job → returns `{ jobId }` |
+| `POST` | `/api/upload-video/:jobId` | Multipart upload (field `video`) |
+| `POST` | `/api/upload-srt/:jobId` | Multipart upload (field `srt`) |
+| `POST` | `/api/upload-zip/:jobId` | Multipart upload (field `zip`) |
+| `POST` | `/api/process/:jobId` | Start async processing. Body: `{ keepBackgroundMusic?: boolean, backgroundVolume?: number }` |
+| `GET`  | `/api/status/:jobId` | Poll progress + per-segment preview |
+| `GET`  | `/api/download/:jobId` | Download final MP4 |
 
-### GET /health
-
-**Response:**
-```json
-{
-  "ok": true,
-  "ffmpeg": true,
-  "ffprobe": true,
-  "routes": [
-    "/upload-video",
-    "/process-batch",
-    "/api/batch/process",
-    "/job/:id",
-    "/download-zip/:sid",
-    "/download-final/:sid",
-    "/download-all/:sid",
-    "/merge/:sid",
-    "/file/:sid/:name",
-    "/cleanup"
-  ]
-}
-```
-
-### POST /process-batch
-
-**Multipart Form:**
-```
-sessionId:   string (required)
-batchIndex:  number (optional, default 0)
-mode:        "natural" | "aggressive" | "smart_hybrid" (default: natural)
-syncMode:    (alternative to mode) "audio-to-video" → "natural", "smart_hybrid" → "smart_hybrid"
-clips:       JSON string of [{ "start": 5.43, "end": 10.86, "index": 0 }, ...]
-settings:    optional JSON {"audioSafeMin": 0.85, "audioSafeMax": 1.25, "loudnessTarget": -16, ...}
-audio:       1 or more files (must match clips count)
-```
-
-**Frontend Field Mapping:**
-- Send either `mode` or `syncMode` (both work)
-- `"audio-to-video"` → backend maps to `"natural"`
-- `"smart_hybrid"` → stays as `"smart_hybrid"`
-- Default if neither provided: `"natural"`
-
-**Response:** `{ "jobId": "...", "total": 5 }`
-
-### POST /merge/:sid
-
-Merges all clips in `clips/` directory into `final_output.mp4`.
-
-**Response:** `{ "ok": true, "file": "final_output.mp4", "downloadUrl": "/file/:sid/final_output.mp4" }`
-
-### processing_log.json
-
-```json
-[
-  {
-    "clip": 0,
-    "start": 5.43,
-    "end": 10.86,
-    "videoDur": 5.43,
-    "audioDur": 6.73,
-    "adjustedAudioDur": 6.73,
-    "requiredTempo": 1.24,
-    "usedAudioTempo": 1.24,
-    "videoReencoded": false,
-    "status": "done"
-  },
-  {
-    "clip": 1,
-    "videoDur": 3.5,
-    "audioDur": 5.2,
-    "adjustedAudioDur": 5.0,
-    "requiredTempo": 1.49,
-    "usedAudioTempo": 1.25,
-    "videoReencoded": true,
-    "status": "done"
-  }
-]
-```
-
-### warnings.json
-
-```json
-[
-  {
-    "clip": 1,
-    "requiredTempo": 1.49,
-    "usedAudioTempo": 1.25,
-    "videoReencoded": true,
-    "reason": "Audio tempo outside safe range, video re-encoded to match"
-  }
-]
-```
-
-## Install (Local)
-
-Requires **Node 20+** and **FFmpeg** (with ffprobe) on PATH.
+## Local dev
 
 ```bash
 cd backend
+cp .env.example .env
 npm install
-npm run dev          # tsx src/server.ts
-# or production:
-npm run build && npm start
+npm run dev
 ```
 
-Verify FFmpeg:
-```bash
-ffmpeg -version
-ffprobe -version
-```
+You must have `ffmpeg` and `ffprobe` installed locally and either on PATH or set via `FFMPEG_PATH` / `FFPROBE_PATH`.
 
-## Environment Variables
+## Deploy to Railway
 
-| Var | Default | Notes |
-|-----|---------|-------|
-| `PORT` | `8080` | HTTP port |
-| `WORK_DIR` | `/data` (Docker) / tmp | Where sessions + clips are stored |
-| `CONCURRENCY` | `8` | Parallel FFmpeg workers per request |
-| `AUDIO_SAFE_MIN` | `0.85` | Minimum safe audio tempo (no video re-encode below) |
-| `AUDIO_SAFE_MAX` | `1.25` | Maximum safe audio tempo (no video re-encode above) |
-| `LOUDNESS_TARGET` | `-16` | Target loudness in LUFS |
-| `FADE_IN_SEC` | `0.03` | Audio fade-in duration (seconds) |
-| `FADE_OUT_SEC` | `0.03` | Audio fade-out duration (seconds) |
-| `VIDEO_CRF` | `18` | H.264 quality for re-encoded clips (0–51, lower = better) |
-| `VIDEO_PRESET` | `veryfast` | H.264 encoding speed (ultrafast..slow) |
-| `NODE_ENV` | `production` | (Docker) |
+1. Push this repo to GitHub.
+2. In Railway → **New Project → Deploy from GitHub repo** → pick this repo.
+3. Set the **Root Directory** to `backend` (if your frontend lives in the same repo).
+4. Railway will detect `railway.json` + `Dockerfile` and build the image (FFmpeg is included in the image).
+5. Add a **Volume** mounted at `/data` so jobs persist across restarts.
+6. Set env vars from `.env.example`. At minimum:
+   - `CORS_ORIGIN` = your frontend URL (e.g. `https://your-app.lovable.app`)
+   - `STORAGE_DIR` = `/data`
+7. Deploy. Note the public URL — that's your `VITE_API_URL` for the frontend.
 
-**Tuning CONCURRENCY:**
-- ~1× CPU cores: safe, slower
-- ~1.5–2× CPU cores: recommended for balanced performance
-- ~4× CPU cores: aggressive, may overwhelm system memory
-- Example: 4-core machine → try `CONCURRENCY=6` or `8`
+## Notes
 
-## Railway Deployment
-
-1. Push this entire folder (root = repo root) to a Git repo.
-2. In Railway:
-   - **New Project → Deploy from GitHub repo**
-   - Select the repo
-3. Railway auto-detects `railway.json` and builds via `Dockerfile`:
-   - FFmpeg is pre-installed in the Node 20 Bookworm image
-   - Build: TypeScript compilation (`tsc`)
-   - Start: `node dist/server.js`
-4. **Set environment variables** (optional):
-   ```
-   CONCURRENCY=12
-   WORK_DIR=/data
-   LOUDNESS_TARGET=-16
-   AUDIO_SAFE_MIN=0.85
-   AUDIO_SAFE_MAX=1.25
-   ```
-5. **Add a Volume** mounted at `/data`:
-   - Jobs survive container restarts
-   - ZIP downloads remain available
-6. Deploy. Health check is `/health`.
-7. Use the public Railway URL (e.g. `https://your-app.up.railway.app`) as the backend URL in the frontend.
-
-## Audio Sync Modes
-
-Send `mode` or `syncMode` in `/process-batch`:
-
-### `natural` (default, recommended for first testing)
-- **Prioritizes voice quality & speed**: Audio tempo stays within natural-sounding range [0.85, 1.25].
-- Video is never re-encoded (always `-c:v copy`).
-- Fast and lossless for video.
-- Best for stable, reliable dubbing with highest voice quality.
-
-### `smart_hybrid` (optional, for extreme mismatches)
-- **Prioritizes matching**: Keeps video copied when possible, re-encodes only when audio tempo is outside [0.85, 1.25].
-- If required tempo is outside range: clamps audio, re-encodes video only.
-- Best if some clips have extreme duration mismatches.
-
-### `aggressive` (deprecated, use with caution)
-- **Prioritizes exact timing**: Chains atempo filters to hit any target (within [0.5, 2.0]).
-- Voice may sound robotic at extreme speeds.
-- Use only when exact sync is mandatory and narration quality is not critical.
-
-## Quality Guarantees
-
-✅ **Natural Mode Clips** (default):
-- `-c:v copy` (zero re-encoding, lossless)
-- Original codec, resolution, bitrate, FPS preserved
-- Instant processing
-- Narration tempo clamped to natural range [0.85–1.25]
-
-✅ **Re-encoded Clips** (smart_hybrid only, outside safe range):
-- `-c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p`
-- Resolution preserved, zero crop/resize
-- FPS preserved
-- High quality (CRF 18 ≈ HD/4K visually lossless)
-
-✅ **Final Merge**:
-- `-c copy` (concatenate without re-encoding)
-- All clips must have matching codec, resolution, FPS, audio format
-
-## Output Structure
-
-After `/process-batch` + `/merge/:sid`:
-
-```
-/data/<sessionId>/
-├── source.mp4                # uploaded base video
-├── in/                       # uploaded audio files (auto-cleaned)
-├── clips/
-│   ├── 00001.mp4
-│   ├── 00002.mp4
-│   └── ...
-├── final_output.mp4          # merged result
-├── processing_log.json       # per-clip logs
-└── warnings.json             # re-encoded clip warnings
-```
-
-## Multi-Backend Deployment (Important ⚠️)
-
-**If batches are processed on multiple Railway backends**, each backend only has its own clips in its `/data` volume.
-
-**Problem:** Final merge into one MP4 works only when:
-- ✅ All clips are on one backend, OR
-- ✅ Frontend collects all batch ZIPs and sends all clips to one merge backend
-
-**Solution for Multi-Backend Setup:**
-1. Frontend processes batch 1 on Backend A → clips in `/data/sessionId/clips/` on A
-2. Frontend processes batch 2 on Backend B → clips in `/data/sessionId/clips/` on B
-3. **To merge:** Frontend must:
-   - Download all clips from Backend A (`/download-zip/:sid`)
-   - Download all clips from Backend B (`/download-zip/:sid`)
-   - Extract both ZIPs
-   - Upload extracted clips to one backend
-   - Call `/merge/:sid` on that backend
-
-**Recommended:** Use a single backend for all batches of one session, or implement frontend logic to collect and consolidate clips before merge.
-
-## Troubleshooting
-
-### Merge fails: "Codec mismatch"
-- Clips may have different codecs if uploaded from different sources.
-- Solution: Re-encode all clips with matching codec before merge.
-- Contact backend maintainer for automated codec normalization endpoint.
-
-### One clip fails; should batch fail?
-- **No.** Batch continues; failed clip is marked in `processing_log.json`.
-- Check `warnings.json` and logs for details.
-- Manually re-process that clip.
-
-### Video speed sounds weird
-- Check `processing_log.json` — check `usedAudioTempo` field.
-- If `videoReencoded` is `true`, video may have been re-encoded (smart_hybrid mode only).
-- In natural mode, video is never re-encoded; audio tempo is clamped instead.
-
-### Clips are huge; can I lower quality?
-- `VIDEO_CRF`: Higher value = lower quality. Default 18 is high quality; try 22–26 for smaller files.
-- `VIDEO_PRESET`: Slower preset = smaller file. Default is veryfast; try `fast` or `medium`.
-- Or accept that natural mode clips use `-c:v copy` and only re-encoded clips vary in size (smart_hybrid only).
-
-### Fade-out clicks or pops
-- Fade times are very short (0.03 sec default) by design.
-- Increase `FADE_OUT_SEC` env var (e.g., `0.1`) if needed.
-- Ensure loudnorm is applied before fades (pipeline order matters).
-
-## API Compatibility
-
-- Old endpoints (`/download-zip/:sid`, `/file/:sid/:name`) still work.
-- Default `/process-batch` mode is now `natural` (was `smart_hybrid` in v3).
-- Settings JSON is optional; all defaults work out of the box.
-- Backend now accepts both `mode` and `syncMode` fields; no breaking changes.
-
-## Performance
-
-- **Natural mode, all clips**: ~5–10 clips/sec (depending on video duration & CPU).
-- **Smart hybrid, mostly normal clips**: ~5–10 clips/sec.
-- **Smart hybrid with re-encoding**: Re-encoded clips slower (~30 sec per clip @ 1080p/CRF18).
-- **Merge**: 2–5 min depending on total duration (fast, no re-encode).
-- **Total for 10 natural-mode clips**: ~1–2 min processing + merge.
-
-## License
-
-MIT
+- FFmpeg path is read from `FFMPEG_PATH` / `FFPROBE_PATH` env vars. Never hardcoded.
+- Video is re-encoded per segment (libx264, CRF 18, veryfast). Adjust in `src/processor.ts` if you need different quality/speed tradeoffs.
+- Speed adjustment uses `setpts` on video only — narration audio is the master timeline and is never time-stretched.
+- ZIP audio matching: numeric-aware filename sort. Files with non-numeric names fall back to creation order. Only `.mp3 .wav .m4a .aac .ogg .flac .opus` are kept; images / JSON / thumbnails / `__MACOSX` are ignored.
+- 8-hour videos work but require a large Railway plan and persistent volume. Plan ≥ 50 GB for 4K source + intermediates.
