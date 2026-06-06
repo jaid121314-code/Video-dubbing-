@@ -15,6 +15,8 @@ export async function extractZip(zipPath: string, destDir: string): Promise<void
   });
 }
 
+/** Collect audio files from a directory, ignoring images / json / txt / hidden / __MACOSX,
+ *  and sort by leading numeric token naturally: 1, 2, 10, 100 (not 1, 10, 100, 2). */
 export async function collectAudioFiles(dir: string): Promise<string[]> {
   const out: string[] = [];
   async function walk(d: string) {
@@ -27,17 +29,22 @@ export async function collectAudioFiles(dir: string): Promise<string[]> {
     }
   }
   await walk(dir);
-  // Natural sort by basename so file2 < file10
-  out.sort((a, b) =>
-    path.basename(a).localeCompare(path.basename(b), undefined, { numeric: true, sensitivity: "base" })
-  );
-  // If still ambiguous, fall back to ctime
-  const withStat = await Promise.all(out.map(async (f) => ({ f, ct: (await stat(f)).ctimeMs })));
-  // Only reorder if no numeric token detected
-  const hasNumbers = out.every((f) => /\d/.test(path.basename(f)));
-  if (!hasNumbers) {
-    withStat.sort((a, b) => a.ct - b.ct);
-    return withStat.map((x) => x.f);
+
+  // Prefer numeric token at start of basename for natural sort
+  const keyed = out.map((f) => {
+    const base = path.basename(f);
+    const m = base.match(/^(\d+)/);
+    const num = m ? parseInt(m[1], 10) : Number.POSITIVE_INFINITY;
+    return { f, base, num };
+  });
+
+  const allNumeric = keyed.every((k) => isFinite(k.num));
+  if (allNumeric) {
+    keyed.sort((a, b) => a.num - b.num || a.base.localeCompare(b.base));
+  } else {
+    keyed.sort((a, b) =>
+      a.base.localeCompare(b.base, undefined, { numeric: true, sensitivity: "base" }),
+    );
   }
-  return out;
+  return keyed.map((k) => k.f);
 }
