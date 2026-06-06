@@ -1,49 +1,111 @@
-# AutoDub Sync Studio — Backend
+# AutoDub Sync Studio — Backend (v1.1)
 
-Node.js + TypeScript + Express + FFmpeg backend for AutoDub Sync Studio. Cuts a source video by an SRT, swaps each segment's audio with a matching narration clip, speed-adjusts video to match narration duration exactly, and concatenates everything into a final dubbed MP4.
+Production-hardened Node.js + TypeScript + Express + FFmpeg backend. Cuts a source
+video by SRT, replaces each segment's audio with a matching narration clip,
+speed-adjusts the video to match narration exactly, then re-encodes a single
+phone/browser/VLC/YouTube-safe MP4.
+
+## What's new in v1.1
+
+- Safe final encode: `libx264 -preset veryfast -crf 27 -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -ar 48000 -movflags +faststart` (no more ultrafast bloat).
+- **Smart CRF**: auto-tunes by source resolution/bitrate so a 350 MB source typically stays ~400 MB–1.2 GB instead of exploding to 7 GB.
+- **FPS lock**: probes source with ffprobe, forces output to `OUTPUT_FPS` (default 30), `fps=` filter + `-vsync cfr`. No more variable FPS.
+- **Narration is master**: video is speed-adjusted with `setpts=ptsFactor*PTS`, then the segment is hard-cut to `audioDuration`. Narration audio is never time-stretched.
+- **Timestamp normalization**: clamps negative starts to 0, clamps overflowing ends to real video duration, marks zero/negative-duration cues invalid. Warnings surface in status.
+- **Pre-render validation**: `POST /api/analyze/:jobId` returns SRT count, audio count, video duration, warnings, and whether validation passed. Render is blocked on mismatch.
+- **Per-segment retry**: up to `SEGMENT_RETRIES` (default 3). Hard fail names the exact segment + FFmpeg error.
+- **ffprobe health check** after final encode.
+- **Range download** (HTTP 206) — fixes mobile/browser failed downloads for large MP4s.
+- **Optional ZIP**: `GET /api/download-zip/:jobId` returns `final.mp4 + sync_report.json + audio_files_report.json` only (no temp segments).
+- **sync_report.json** with per-segment srt/corrected/audio/video/speed/output durations.
+- **Auto cleanup** of completed/failed jobs after `CLEANUP_AFTER_HOURS`.
+- **Stable storage** at `STORAGE_DIR` (Railway volume friendly, e.g. `/data`).
 
 ## Endpoints
 
-All endpoints are JSON unless noted.
-
 | Method | Path | Purpose |
 |---|---|---|
-| `GET`  | `/api/health` | Liveness check |
-| `POST` | `/api/jobs` | Create a new job → returns `{ jobId }` |
-| `POST` | `/api/upload-video/:jobId` | Multipart upload (field `video`) |
-| `POST` | `/api/upload-srt/:jobId` | Multipart upload (field `srt`) |
-| `POST` | `/api/upload-zip/:jobId` | Multipart upload (field `zip`) |
-| `POST` | `/api/process/:jobId` | Start async processing. Body: `{ keepBackgroundMusic?: boolean, backgroundVolume?: number }` |
-| `GET`  | `/api/status/:jobId` | Poll progress + per-segment preview |
-| `GET`  | `/api/download/:jobId` | Download final MP4 |
+| GET  | `/api/health` | Liveness |
+| POST | `/api/jobs` | Create job → `{ ok, jobId }` |
+| POST | `/api/upload-video/:jobId` | Multipart (`video`) |
+| POST | `/api/upload-srt/:jobId` | Multipart (`srt`) |
+| POST | `/api/upload-zip/:jobId` | Multipart (`zip`) |
+| POST | `/api/analyze/:jobId` | Pre-render validation report |
+| POST | `/api/process/:jobId` | Start render. Body: `{ keepBackgroundMusic?, backgroundVolume? }` |
+| GET  | `/api/status/:jobId` | Poll progress, stage, warnings, validation |
+| GET  | `/api/download/:jobId` | MP4 download (Range supported) |
+| GET  | `/api/download-zip/:jobId` | ZIP: final.mp4 + reports |
+| POST | `/api/cleanup/:jobId` | Delete job working dir |
+
+### `/api/process` response shape (compat-friendly)
+
+```json
+{
+  "ok": true,
+  "jobId": "…",
+  "validation": {
+    "videoDuration": 1234.56,
+    "srtSegments": 120,
+    "audioFiles": 120,
+    "countMatch": true,
+    "timestampWarnings": ["…"]
+  }
+}
+```
+
+### Stages returned by `/api/status`
+
+`uploading` → `analyzing` → `validating` → `processing` → `retrying` →
+`failed_segment` → `merging` → `final_encoding` → `completed` / `failed`.
+
+## Environment variables
+
+| Var | Default | Purpose |
+|---|---|---|
+| `PORT` | `8080` | HTTP port |
+| `FFMPEG_PATH` | `ffmpeg` | Path to ffmpeg binary |
+| `FFPROBE_PATH` | `ffprobe` | Path to ffprobe binary |
+| `STORAGE_DIR` | `./storage` | Job working dir root (set to `/data` on Railway with a volume) |
+| `VIDEO_CRF` | `27` | Base CRF floor (smart logic may raise for 1080p/4K) |
+| `FFMPEG_PRESET` | `veryfast` | x264 preset (don't use ultrafast in prod) |
+| `AUDIO_BITRATE` | `128k` | AAC bitrate |
+| `OUTPUT_FPS` | `30` | Forced output FPS |
+| `MAX_UPLOAD_BYTES` | `17179869184` (16 GB) | Per-file upload cap |
+| `CORS_ORIGIN` | `*` | Comma-separated allow list |
+| `SEGMENT_RETRIES` | `3` | Per-segment retry attempts |
+| `CLEANUP_AFTER_HOURS` | `24` | Hours before completed/failed jobs are removed |
 
 ## Local dev
 
 ```bash
 cd backend
-cp .env.example .env
 npm install
 npm run dev
 ```
 
-You must have `ffmpeg` and `ffprobe` installed locally and either on PATH or set via `FFMPEG_PATH` / `FFPROBE_PATH`.
+Requires local `ffmpeg` and `ffprobe`.
 
 ## Deploy to Railway
 
 1. Push this repo to GitHub.
-2. In Railway → **New Project → Deploy from GitHub repo** → pick this repo.
-3. Set the **Root Directory** to `backend` (if your frontend lives in the same repo).
-4. Railway will detect `railway.json` + `Dockerfile` and build the image (FFmpeg is included in the image).
-5. Add a **Volume** mounted at `/data` so jobs persist across restarts.
-6. Set env vars from `.env.example`. At minimum:
-   - `CORS_ORIGIN` = your frontend URL (e.g. `https://your-app.lovable.app`)
-   - `STORAGE_DIR` = `/data`
-7. Deploy. Note the public URL — that's your `VITE_API_URL` for the frontend.
+2. Railway → New Project → Deploy from GitHub repo → pick the repo.
+3. Set the **Root Directory** to `backend` if frontend lives alongside.
+4. Railway auto-uses `railway.json` + `Dockerfile` (FFmpeg included).
+5. Add a **Volume** mounted at `/data`.
+6. Set env vars (at minimum):
+   - `CORS_ORIGIN=https://your-frontend.lovable.app`
+   - `STORAGE_DIR=/data`
+7. Deploy. Use the public URL as your frontend's API base.
+
+## Output size expectations
+
+For a 350 MB 1080p source, output typically lands ~400 MB–1.2 GB depending on
+length and audio. Source-aware CRF avoids the 7 GB ultrafast blowup.
 
 ## Notes
 
-- FFmpeg path is read from `FFMPEG_PATH` / `FFPROBE_PATH` env vars. Never hardcoded.
-- Video is re-encoded per segment (libx264, CRF 18, veryfast). Adjust in `src/processor.ts` if you need different quality/speed tradeoffs.
-- Speed adjustment uses `setpts` on video only — narration audio is the master timeline and is never time-stretched.
-- ZIP audio matching: numeric-aware filename sort. Files with non-numeric names fall back to creation order. Only `.mp3 .wav .m4a .aac .ogg .flac .opus` are kept; images / JSON / thumbnails / `__MACOSX` are ignored.
-- 8-hour videos work but require a large Railway plan and persistent volume. Plan ≥ 50 GB for 4K source + intermediates.
+- Final MP4 is always re-encoded after `concat` (no `-c copy`-only final). This
+  guarantees a clean moov atom and prevents partial / corrupt downloads.
+- ZIP audio sort: numeric-prefix natural sort (1, 2, 10, 100). Ignores
+  `__MACOSX`, dotfiles, images, JSON, txt.
+- Default download is direct MP4. ZIP is opt-in via `/api/download-zip/:jobId`.
