@@ -70,4 +70,8 @@ export class JobStore {
   fail(id: string, error: string): void {
     this.update(id, { stage: ProcessStage.Failed, error });
   }
+
+  remove(id: string): void {
+    this.jobs.delete(id);
+  }
 }

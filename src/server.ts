@@ -68,6 +68,46 @@ app.post("/api/upload-video/:jobId", (req, res, next) => {
   });
 });
 
+// Fallback: accept the FULL source video and trim it server-side using
+// ffmpeg. Used when the browser's ffmpeg.wasm cannot cut the file locally
+// (low memory, mobile browser, etc.). Query params: start (sec), duration (sec).
+app.post("/api/upload-video-cut/:jobId", (req, res, next) => {
+  uploader("video")(req, res, async (err) => {
+    if (err) return next(err);
+    const r = withJob(req, res); if (!r.ok) return;
+    const start = parseFloat((req.query.start as string) || "0");
+    const duration = parseFloat((req.query.duration as string) || "0");
+    if (!isFinite(duration) || duration <= 0) {
+      return res.status(400).json({ error: "duration query param required" });
+    }
+    const fullPath = req.file!.path;
+    const ext = path.extname(fullPath) || ".mp4";
+    const trimmedPath = path.join(path.dirname(fullPath), `video_trimmed${ext}`);
+    try {
+      const { runFfmpeg } = await import("./ffmpeg.js");
+      const { rm } = await import("node:fs/promises");
+      await runFfmpeg([
+        "-y",
+        "-ss", start.toFixed(3),
+        "-i", fullPath,
+        "-t", duration.toFixed(3),
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        "-reset_timestamps", "1",
+        "-movflags", "+faststart",
+        trimmedPath,
+      ]);
+      await rm(fullPath, { force: true }).catch(() => {});
+      r.job.assets.videoPath = trimmedPath;
+      store.update(r.job.id, { stage: ProcessStage.Uploading, assets: r.job.assets });
+      res.json({ ok: true, path: trimmedPath });
+    } catch (e: any) {
+      console.error("[upload-video-cut] trim failed", e);
+      res.status(500).json({ error: e?.message || "trim failed" });
+    }
+  });
+});
+
 app.post("/api/upload-srt/:jobId", (req, res, next) => {
   uploader("srt")(req, res, (err) => {
     if (err) return next(err);
@@ -161,6 +201,20 @@ app.get("/api/download/:jobId", async (req, res) => {
   res.setHeader("Content-Length", s.size.toString());
   res.setHeader("Content-Disposition", `attachment; filename="autodub_${j.id}.mp4"`);
   createReadStream(j.finalPath).pipe(res);
+});
+
+// Cleanup a finished job — removes the job's working directory.
+app.delete("/api/jobs/:jobId", async (req, res) => {
+  const r = withJob(req, res); if (!r.ok) return;
+  const j = r.job;
+  try {
+    const { rm } = await import("node:fs/promises");
+    await rm(j.workDir, { recursive: true, force: true });
+  } catch (e) {
+    console.warn("[cleanup] failed to remove workdir", e);
+  }
+  try { (store as any).remove?.(j.id); } catch {}
+  res.json({ ok: true });
 });
 
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
