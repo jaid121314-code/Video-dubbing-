@@ -18,6 +18,13 @@ export interface JobAssets {
   videoPath?: string;
   srtPath?: string;
   zipPath?: string;
+  introPath?: string;
+}
+
+export interface VideoTransform {
+  zoom: number;     // >= 1.0
+  offsetX: number;  // source pixels, +right
+  offsetY: number;  // source pixels, +down
 }
 
 export interface JobPreview {

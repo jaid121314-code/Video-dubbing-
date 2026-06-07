@@ -28,7 +28,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "2mb" }));
 
-function uploader(field: "video" | "srt" | "zip") {
+function uploader(field: "video" | "srt" | "zip" | "intro") {
   const storage = multer.diskStorage({
     destination: async (req, _file, cb) => {
       const jobId = (req.params as any).jobId;
@@ -42,6 +42,7 @@ function uploader(field: "video" | "srt" | "zip") {
   });
   return multer({ storage, limits: { fileSize: MAX_UPLOAD_BYTES } }).single(field);
 }
+
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
@@ -92,6 +93,27 @@ app.post("/api/upload-zip/:jobId", (req, res, next) => {
   });
 });
 
+app.post("/api/upload-intro/:jobId", (req, res, next) => {
+  uploader("intro")(req, res, (err) => {
+    if (err) return next(err);
+    const r = withJob(req, res); if (!r.ok) return;
+    r.job.assets.introPath = req.file!.path;
+    store.update(r.job.id, { assets: r.job.assets });
+    res.json({ ok: true, path: req.file!.path, size: req.file!.size });
+  });
+});
+
+app.delete("/api/upload-intro/:jobId", async (req, res) => {
+  const r = withJob(req, res); if (!r.ok) return;
+  if (r.job.assets.introPath) {
+    await rm(r.job.assets.introPath, { force: true }).catch(() => {});
+    r.job.assets.introPath = undefined;
+    store.update(r.job.id, { assets: r.job.assets });
+  }
+  res.json({ ok: true });
+});
+
+
 async function buildValidation(job: ReturnType<JobStore["get"]>): Promise<JobValidation> {
   if (!job) throw new Error("Job missing");
   if (!job.assets.videoPath || !job.assets.srtPath || !job.assets.zipPath) {
@@ -138,7 +160,20 @@ app.post("/api/analyze/:jobId", async (req, res) => {
 app.post("/api/process/:jobId", async (req, res) => {
   const r = withJob(req, res); if (!r.ok) return;
   const job = r.job;
-  const { keepBackgroundMusic = false, backgroundVolume = 0.15 } = req.body ?? {};
+  const {
+    keepBackgroundMusic = false,
+    backgroundVolume = 0.15,
+    transform,
+    useIntro = true,
+  } = req.body ?? {};
+
+  // Sanitize transform
+  const tf = transform && typeof transform === "object" ? {
+    zoom: Math.max(1, Math.min(3, Number(transform.zoom) || 1)),
+    offsetX: Math.max(-10000, Math.min(10000, Number(transform.offsetX) || 0)),
+    offsetY: Math.max(-10000, Math.min(10000, Number(transform.offsetY) || 0)),
+  } : undefined;
+
 
   if (!job.assets.videoPath || !job.assets.srtPath || !job.assets.zipPath) {
     return res.status(400).json({ ok: false, error: "Missing video, srt, or zip upload" });
@@ -200,7 +235,10 @@ app.post("/api/process/:jobId", async (req, res) => {
         keepBackgroundMusic: !!keepBackgroundMusic,
         backgroundVolume: Number(backgroundVolume) || 0.15,
         store,
+        transform: tf,
+        introPath: useIntro ? job.assets.introPath : undefined,
       });
+
 
       // Write reports
       const reportPath = path.join(job.workDir, "output", "sync_report.json");

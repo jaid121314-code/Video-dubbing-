@@ -53,24 +53,31 @@ export function normalizeSegments(
   // Sort defensively
   segments.sort((a, b) => a.startSec - b.startSec);
 
-  // Clamp first start
+  // Clamp / extend first start to 0 (auto-cover video head)
   if (segments[0].startSec < 0) {
-    warnings.push(`First SRT start (${segments[0].startSec.toFixed(3)}s) was < 0; clamped to 0`);
+    warnings.push(
+      `First SRT start (${segments[0].startSec.toFixed(3)}s) was < 0; clamped to 0`,
+    );
+    segments[0].startSec = 0;
+  } else if (segments[0].startSec > 0.05) {
+    warnings.push(
+      `First SRT start (${segments[0].startSec.toFixed(3)}s) is after 0; extended to 0 to cover full video`,
+    );
     segments[0].startSec = 0;
   }
 
-  // Clamp last end to video duration
+  // Clamp / extend last end to match real video duration
   const last = segments[segments.length - 1];
   if (last.endSec > videoDurationSec + 0.05) {
     warnings.push(
       `Last SRT end (${last.endSec.toFixed(3)}s) exceeds video duration (${videoDurationSec.toFixed(3)}s); clamped`,
     );
     last.endSec = videoDurationSec;
-  } else if (last.endSec < videoDurationSec - 0.5) {
-    // not an error, just note
+  } else if (last.endSec < videoDurationSec - 0.05) {
     warnings.push(
-      `Last SRT end (${last.endSec.toFixed(3)}s) ends before video duration (${videoDurationSec.toFixed(3)}s)`,
+      `Last SRT end (${last.endSec.toFixed(3)}s) ends before video duration (${videoDurationSec.toFixed(3)}s); extended to cover full video`,
     );
+    last.endSec = videoDurationSec;
   } else if (last.endSec > videoDurationSec) {
     last.endSec = videoDurationSec;
   }
